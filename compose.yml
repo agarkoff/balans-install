@@ -1,0 +1,154 @@
+name: budget
+
+services:
+  db:
+    image: postgres:16-alpine
+    # jit=off: приложение — короткие веб-запросы (OLTP), не аналитика;
+    # эвристика JIT (порог 100000) срабатывает на CTE/UNION-запросах вроде
+    # v_marketplace_item_categories и добавляет ~1.3 сек компиляции на
+    # каждый вызов при исполнении самого запроса <2 мс (найдено по жалобе
+    # на медленную ленту операций после ввода M14).
+    command: ["postgres", "-c", "jit=off"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      # DB_PORT — на случай занятого 5432 (установщик подбирает свободный)
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    image: ${BALANS_IMAGE:-ghcr.io/agarkoff/balans}:${BALANS_TAG:-latest}
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      RAW_DIR: /data/raw
+      BACKUP_DIR: /data/backup
+      # Мастер первого запуска (пока нет пароля) открыт только этим адресам. За
+      # публикацией порта Docker запрос с хоста приходит с адреса шлюза сети
+      # (172.16.0.0/12), а LAN-клиента от хоста он не отличает: после мастера
+      # защищает пароль. Строже — SETUP_TRUSTED_HOSTS=127.0.0.1,::1 в .env.
+      SETUP_TRUSTED_HOSTS: ${SETUP_TRUSTED_HOSTS:-127.0.0.1,::1,localhost,172.16.0.0/12}
+      UPDATE_DIR: /update
+    volumes:
+      - "${RAW_DIR}:/data/raw:ro"
+      # Единственный подкаталог сырья с записью: выгрузку Т-Инвестиций
+      # скачивает сам сервер (официальный API по токену из настроек);
+      # остальные выгрузки кладут сборщики (collector), сервер их только читает.
+      - "${RAW_DIR}/tinvest:/data/raw/tinvest:rw"
+      - "${BACKUP_DIR}:/data/backup:rw"
+      # Связь с обновлятором (updater): запрос на обновление и его состояние.
+      - update_state:/update
+    ports:
+      # Порт открыт в локальную сеть (D100): вход владельца обязателен,
+      # иначе сервис был бы доступен всем в сети. Локальный доступ — через
+      # тот же порт на 127.0.0.1.
+      - "0.0.0.0:${PORT}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  # Обновление из интерфейса («Доступна новая версия»): без портов, команды
+  # зашиты в tools/updater/run.sh — compose pull и up для сервера api.
+  # Сокет Docker даёт этому контейнеру управление контейнерами компьютера,
+  # поэтому он не принимает ничего, кроме файла-запроса в общем каталоге.
+  updater:
+    image: docker:cli
+    restart: unless-stopped
+    entrypoint: ["sh", "/updater/run.sh"]
+    environment:
+      CHECK_EVERY: ${UPDATE_CHECK_EVERY:-600}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - update_state:/update
+      - ./tools/updater:/updater:ro
+      - .:/project:ro
+
+  # Сборщики выписок («Обновить выписки», tools/balans.ps1 update): по
+  # требованию, `docker compose run --rm collector python scrape/update.py …`.
+  # Браузер — на хосте (окно с отладочным портом 9333), сборщик ходит к
+  # нему через host.docker.internal и пишет выгрузки в RAW_DIR.
+  collector:
+    profiles: ["tools"]
+    image: ${BALANS_IMAGE:-ghcr.io/agarkoff/balans}:${BALANS_TAG:-latest}
+    environment:
+      CDP_HOST: host.docker.internal
+      RAW_DIR: /data/raw
+      # период анализа — у сервера; у dev-окружения он api-dev
+      API_URL: ${COLLECTOR_API_URL:-http://api:8000}
+      # машинный доступ к API (D100): сервер требует вход, сборщик ходит
+      # с Bearer-токеном из .env
+      API_TOKEN: ${API_TOKEN}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - "${RAW_DIR}:/data/raw:rw"
+
+  # --- dev-профиль: код с хоста, перезагрузка, SPA из Vite ---
+  api-dev:
+    profiles: ["dev"]
+    build:
+      context: ./service
+      target: dev
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      RAW_DIR: /data/raw
+      BACKUP_DIR: /data/backup
+      # Мастер первого запуска (пока нет пароля) открыт только этим адресам. За
+      # публикацией порта Docker запрос с хоста приходит с адреса шлюза сети
+      # (172.16.0.0/12), а LAN-клиента от хоста он не отличает: после мастера
+      # защищает пароль. Строже — SETUP_TRUSTED_HOSTS=127.0.0.1,::1 в .env.
+      SETUP_TRUSTED_HOSTS: ${SETUP_TRUSTED_HOSTS:-127.0.0.1,::1,localhost,172.16.0.0/12}
+      ALLOWED_ORIGIN: http://127.0.0.1:${VITE_PORT:-5173},http://192.168.1.107:${VITE_PORT:-5173}
+      SERVE_STATIC: "0"
+      # Версия в шапке — хеш HEAD из .git (читается без git, см. app/version.py).
+      GIT_DIR: /repo-git
+    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir app"]
+    volumes:
+      - ./service:/srv
+      - ./.git:/repo-git:ro
+      # Док-контракты: тесты сверяют specification тем знания и ссылки
+      # AI-SEMANTICS.md с файлами docs/ и plan/ (в образ они не входят).
+      - ./docs:/docs:ro
+      - ./plan:/plan:ro
+      - "${RAW_DIR}:/data/raw:ro"
+      - "${RAW_DIR}/tinvest:/data/raw/tinvest:rw"
+      - "${BACKUP_DIR}:/data/backup:rw"
+    ports:
+      - "0.0.0.0:${PORT}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    profiles: ["dev"]
+    image: node:20-alpine
+    working_dir: /srv/web
+    command: ["sh", "-c", "npm ci && npm run dev -- --host 0.0.0.0 --port ${VITE_PORT:-5173}"]
+    environment:
+      VITE_API_PROXY: http://api-dev:8000
+    volumes:
+      - ./service:/srv
+      - web_node_modules:/srv/web/node_modules
+    ports:
+      - "0.0.0.0:${VITE_PORT:-5173}:${VITE_PORT:-5173}"
+    depends_on:
+      - api-dev
+
+volumes:
+  pgdata:
+  web_node_modules:
+  update_state:
