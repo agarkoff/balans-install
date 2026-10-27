@@ -1,4 +1,4 @@
-﻿# Установка Баланса одной командой (PowerShell, Windows):
+# Установка Баланса одной командой (PowerShell, Windows):
 #
 #   irm https://raw.githubusercontent.com/agarkoff/balans-install/main/install.ps1 | iex
 #
@@ -8,7 +8,9 @@
 # Повторный запуск - обновление: файлы заменяются, база, настройки и выписки
 # (.env, data) не трогаются.
 #
-# Файл в UTF-8 с BOM - иначе PowerShell 5.1 ломает русский текст при запуске из файла.
+# Файл в UTF-8 БЕЗ BOM: irm отдаёт текст с BOM как есть, и iex спотыкается о невидимый
+# символ в начале первой строки. Запускать только через irm | iex: сохранённый на диск
+# файл без BOM PowerShell 5.1 прочтёт в ANSI и испортит русский текст.
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
